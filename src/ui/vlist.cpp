@@ -523,6 +523,14 @@ void VirtualList::layout() {
             if (b > a && (a < s0 - 0.01f || b > s1 + 0.01f))
                 uniform = false;
         }
+    // A hover-only overlay (the dismiss ×) leaves a trail if we just shift
+    // the old pixels for it, so force a real repaint instead.
+    if (uniform)
+        for (const Live &l : _live)
+            if (l.view->hasLiveOverlay()) {
+                uniform = false;
+                break;
+            }
 
     // 5. Damage: a blit and the strip, or the whole viewport.
     if (!uniform) {

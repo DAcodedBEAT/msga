@@ -73,6 +73,7 @@ public:
 
     void        paint(gfx::Painter &p) override;
     void        paintOver(gfx::Painter &p) override;
+    bool        hasLiveOverlay() const override { return _attach >= 0; }
     void        styleChanged() override;
     bool        onEvent(ui::Event &e) override;
     std::string tooltip() const override;
