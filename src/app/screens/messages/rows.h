@@ -110,6 +110,9 @@ private:
     void      buildInlineThread(ui::View *col, const model::Message &root);
     void      buildFile(ui::View *col, const model::File &f, Ts ts);
     void      buildGallery(ui::View *col, const std::vector<const model::File *> &files, Ts ts);
+    // Pictures first (gallery or single), then the rest via buildFile.
+    // Shared by the message body and a forwarded message's own files.
+    void      buildFilesSection(ui::View *col, const std::vector<model::File> &files, Ts ts);
     void      buildAttachment(ui::View *col, const model::Message &m, size_t index, bool root);
     // The buttons of attachment `owner` (1-based; 0 = the message's own) as a row.
     void      buildButtons(ui::View *col, const model::Message &m, int32_t owner);
