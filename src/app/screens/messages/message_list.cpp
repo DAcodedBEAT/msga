@@ -54,6 +54,19 @@ const model::File *fileAt(const model::Message *m, const std::string &path) {
     return nullptr;
 }
 
+// …or a shared message's (a forwarded message's files are its attachment's):
+// those can be viewed, saved and copied, never deleted or forwarded from here.
+const model::File *anyFileAt(const model::Message *m, const std::string &path) {
+    if (const model::File *f = fileAt(m, path))
+        return f;
+    if (m)
+        for (const model::Attachment &a : m->attachments())
+            for (const model::File &f : a.files)
+                if (f.path == path)
+                    return &f;
+    return nullptr;
+}
+
 uint64_t keyOf(const MessageList::Item &it) {
     switch (it.kind) {
     case Kind::Day:
@@ -162,12 +175,13 @@ public:
         button(gfx::Icon::Download, N_("Download"), actions)->onClick = [this] {
             _list->downloadFile(_ts, _file.path);
         };
-        button(gfx::Icon::Share2, N_("Forward"), actions && bool(ctx.forwardMessage))->onClick =
-            [this] {
-                close(); // the forward dialog replaces the viewer
-                if (_ctx.forwardMessage)
-                    _ctx.forwardMessage(_list->conversation(), _ts, _file.path);
-            };
+        // A shared message's file is only viewed: forwarding sends the message's own.
+        const bool forward = actions && bool(ctx.forwardMessage) && fileAt(m, f.path);
+        button(gfx::Icon::Share2, N_("Forward"), forward)->onClick = [this] {
+            close(); // the forward dialog replaces the viewer
+            if (_ctx.forwardMessage)
+                _ctx.forwardMessage(_list->conversation(), _ts, _file.path);
+        };
         button(
             gfx::Icon::ExternalLink,
             N_("Open in browser"),
@@ -587,7 +601,7 @@ void MessageList::downloadFile(Ts ts, const std::string &path) {
     // original (source(): for audio, path is Slack's transcode) to it, the
     // footer's cog running from the choice until the bytes are on disk.
     const model::Message *m = message(ts);
-    const model::File    *f = m && !m->pending ? fileAt(m, path) : nullptr;
+    const model::File    *f = m && !m->pending ? anyFileAt(m, path) : nullptr;
     if (!f)
         return;
     const std::string name   = f->name.empty() ? std::string(tr("file")) : f->name;
@@ -1772,7 +1786,7 @@ std::vector<ui::MenuItem> MessageList::menuItems(Ts ts) const {
 std::vector<ui::MenuItem> MessageList::fileMenuItems(Ts ts, const std::string &path) const {
     std::vector<ui::MenuItem> items;
     const model::Message     *m     = message(ts);
-    const model::File        *f     = fileAt(m, path);
+    const model::File        *f     = anyFileAt(m, path);
     const bool                image = !f || f->isImage();
     if (f && isCsv(*f))
         addItem(items, kPreview); // the table viewer
@@ -1782,7 +1796,7 @@ std::vector<ui::MenuItem> MessageList::fileMenuItems(Ts ts, const std::string &p
     const Store &st = _ctx.store;
     const bool   canDelete =
         m && (m->user == st.me || (st.me != model::kNoUser && st.user(st.me).admin));
-    if (f && canDelete && !f->id.empty()) {
+    if (f && canDelete && !f->id.empty() && fileAt(m, path)) {
         ui::addMenuSeparator(items);
         addItem(items, kDeleteFile).label = image ? tr("Delete image…") : tr("Delete file…");
     }
@@ -1954,12 +1968,12 @@ void MessageList::runMenuAction(Ts ts, int id, const std::string &path, ui::Poin
             );
         break;
     case kPreview:
-        if (const model::File *f = fileAt(msg, path))
+        if (const model::File *f = anyFileAt(msg, path))
             openCsvPreview(*f);
         break;
     case kCopyImageLink:
     case kCopyFileLink: // the file's permalink, else the original (never a thumbnail)
-        if (const model::File *f = fileAt(msg, path))
+        if (const model::File *f = anyFileAt(msg, path))
             copy = f->permalink.empty() ? fileUrl(f->source()) : f->permalink;
         else
             copy = fileUrl(path);
@@ -1969,7 +1983,7 @@ void MessageList::runMenuAction(Ts ts, int id, const std::string &path, ui::Poin
             _ctx.backend.deleteFile(conv, ts, f->id);
         break;
     case kCopyImage:
-        if (const model::File *f = fileAt(msg, path))
+        if (const model::File *f = anyFileAt(msg, path))
             copyImage(*f);
         break;
     default:
@@ -2554,7 +2568,7 @@ void MessageList::toggleUnfurl(Ts ts, int attachment) {
 }
 
 void MessageList::openFileViewer(Ts ts, const std::string &path) {
-    if (const model::File *f = fileAt(message(ts), path); f && window())
+    if (const model::File *f = anyFileAt(message(ts), path); f && window())
         showFileViewer(_ctx, *window(), this, ts, *f);
 }
 

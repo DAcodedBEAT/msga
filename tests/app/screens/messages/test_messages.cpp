@@ -1501,6 +1501,48 @@ TEST("actions: the link and file menus") {
     pump(2);
 }
 
+TEST("actions: a shared message's files open in the viewer, never deleted or forwarded") {
+    Env e(false);
+    e.ctx.forwardMessage = [](ConvRef, Ts, const std::string &) {};
+    const int64_t     t0 = base::nowSecs() - 3600;
+    model::Attachment un;
+    un.msgUnfurl   = true;
+    un.linkPreview = true;
+    un.author      = "Mira";
+    un.channel     = "C1";
+    un.ts          = (t0 - 60) * 1000000;
+    model::File img;
+    img.id     = "FIMG";
+    img.name   = "mira.png";
+    img.mime   = "image/png";
+    img.path   = asset("avatars/mira.png");
+    img.width  = 256;
+    img.height = 256;
+    un.files.push_back(img);
+    model::Message m = msg(0, t0, "look"); // mine: its own files could be deleted
+    m.extras().attachments.push_back(un);
+    std::vector<model::Message> ms;
+    ms.push_back(std::move(m));
+    e.list->showConversation(addConv(e.store, std::move(ms)));
+    pump(8);
+    const Ts ts = t0 * 1000000;
+    CHECK_STR(
+        menuLabels(e.list->fileMenuItems(ts, img.path)), "Copy link to image|Copy full image"
+    );
+    e.list->openFileViewer(ts, img.path);
+    pump(2);
+    ui::Popup *viewer = e.win->topPopup();
+    REQUIRE(viewer != nullptr);
+    ui::View *download = findByTooltip(viewer, "Download");
+    ui::View *forward  = findByTooltip(viewer, "Forward");
+    REQUIRE(download != nullptr);
+    REQUIRE(forward != nullptr);
+    CHECK(download->visible());
+    CHECK_FALSE(forward->visible());
+    viewer->close();
+    pump(2);
+}
+
 TEST("actions: a remote CSV's Preview downloads it to a temporary file, removed once read") {
     Env           e(true);
     const ConvRef general = e.conv("C0GENERAL");
