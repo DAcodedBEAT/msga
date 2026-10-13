@@ -2603,12 +2603,21 @@ const std::string *MessageList::canvasPreview(const std::string &id, int *state)
                 p.html  = std::move(html);
                 p.state = error.empty() && !p.html.empty() ? 1 : -1;
             }
-        // The cards read it when bound again.
+        // The cards read it when bound again (a forwarded message's too).
+        const auto has = [&id](const std::vector<model::File> &files) {
+            for (const model::File &f : files)
+                if (f.id == id)
+                    return true;
+            return false;
+        };
         for (size_t i = 0; i < _items.size(); ++i)
-            if (const model::Message *m = message(_items[i].ts))
-                for (const model::File &f : m->files())
-                    if (f.id == id)
-                        rowsChanged(int(i), 1);
+            if (const model::Message *m = message(_items[i].ts)) {
+                bool shown = has(m->files());
+                for (const model::Attachment &a : m->attachments())
+                    shown = shown || has(a.files);
+                if (shown)
+                    rowsChanged(int(i), 1);
+            }
     });
     return nullptr;
 }

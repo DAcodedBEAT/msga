@@ -3157,6 +3157,53 @@ TEST("blocks: a table, a canvas card and a selection as rendered (MSGA_TEST_DUMP
     win.reset();
 }
 
+TEST("blocks: a forwarded canvas's card re-binds once its preview is in") {
+    struct CanvasBackend : DownloadingBackend {
+        using DownloadingBackend::DownloadingBackend;
+        void loadCanvasContent(const std::string &, CanvasHtmlDone done) override {
+            pending = std::move(done);
+        }
+        CanvasHtmlDone pending;
+    };
+    model::Store     store;
+    CanvasBackend    backend{store, app().platform()};
+    ImageCache       images{app().platform()};
+    Context          ctx{app(), store, backend, images};
+    plat::WindowDesc d;
+    d.size                 = {800, 600};
+    auto              win  = std::make_unique<ui::Window>(d);
+    auto             *list = win->root().add<MessageList>(ctx);
+    const int64_t     t0   = base::nowSecs() - 3600;
+    const ConvRef     c    = addConv(store, {});
+    model::Attachment un;
+    un.msgUnfurl   = true;
+    un.linkPreview = true;
+    un.author      = "Mira";
+    un.channel     = "C1";
+    un.ts          = (t0 - 60) * 1000000;
+    model::File cv;
+    cv.id    = "FCANVAS";
+    cv.name  = "crit";
+    cv.title = "Crit";
+    cv.mime  = "application/vnd.slack-docs";
+    un.files.push_back(cv);
+    model::Message m = msg(1, t0, "see this");
+    m.extras().attachments.push_back(un);
+    store.addPage(c, [&] {
+        std::vector<model::Message> v;
+        v.push_back(std::move(m));
+        return v;
+    }());
+    list->showConversation(c);
+    pump(10);
+    REQUIRE(bool(backend.pending)); // the card asked for its preview
+    const int binds = list->rowBinds();
+    backend.pending("<h1>Crit</h1><p>Action items</p>", {});
+    pump(4);
+    CHECK(list->rowBinds() > binds);
+    win.reset();
+}
+
 TEST("blocks: a bot card's mrkdwn title, Show more and its own buttons (MSGA_TEST_DUMP)") {
     // Outlook Calendar's reminder: the title holds dates and a link, the
     // long text folds, the second attachment is only its button.
