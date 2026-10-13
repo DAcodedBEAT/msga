@@ -1660,9 +1660,11 @@ void MessageRow::buildUnfurl(ui::View *col, const model::Message &m, size_t inde
         const Ts                 thread = ref.conv == a.channel ? model::parseTs(ref.threadTs) : 0;
 
         // Jumps to the quoted message, same as a permalink link (rich.cpp).
+        // Muted, underlines on hover like Slack's own client --
+        // Kind::Link targets already get that for free (RichLabel::hoverLink).
         auto *posted = lines->add<RichLabel>(ctx, this);
         posted->setContent(
-            styled(arg(tr("Posted in %1"), place), Font::Small, C::Link, 1),
+            styled(arg(tr("Posted in %1"), place), Font::Small, C::TextMuted, 1),
             {{mrkdwn::Kind::Link, {}}},
             {}
         );
