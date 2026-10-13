@@ -856,6 +856,78 @@ void testAnimBudget() {
     CHECK(AnimOptions{}.maxPixels >= int64_t(240) * 160 * int64_t(full.size()));
 }
 
+// Regression: a real GIF stopped animating partway through because its LZW
+// stream never cleared and overflowed the dictionary. Built synthetically
+// here (a single-color GIF whose stream never clears) since the real file
+// isn't ours to redistribute.
+void testGifLzwDictionaryLimit() {
+    constexpr int lzwCs = 2, clear = 1 << lzwCs, eos = clear + 1;
+    constexpr int w = 100, h = 100, n = w * h; // enough pixels to pass the old 8192-entry ceiling
+
+    // Variable-width LZW bit packer, LSB-first per the GIF spec.
+    struct BitWriter {
+        std::vector<uint8_t> bytes;
+        int                  bitPos = 0;
+        void                 write(int value, int bits) {
+            for (int i = 0; i < bits; ++i) {
+                const int bit = (value >> i) & 1;
+                if (bitPos % 8 == 0)
+                    bytes.push_back(0);
+                bytes.back() |= uint8_t(bit << (bitPos % 8));
+                ++bitPos;
+            }
+        }
+    } bw;
+
+    // Encode every pixel as the literal color index 0, with no clear code
+    // in between -- the dictionary just keeps growing, same as the real
+    // file that triggered this bug.
+    int codesize = lzwCs + 1, avail = clear + 2, oldcode = -1;
+    bw.write(clear, codesize);
+    for (int i = 0; i < n; ++i) {
+        bw.write(0, codesize);
+        if (oldcode >= 0 && avail < 4096)
+            ++avail;
+        if ((avail & ((1 << codesize) - 1)) == 0 && avail <= 0x0FFF)
+            ++codesize;
+        oldcode = 0;
+    }
+    bw.write(eos, codesize);
+
+    // Wrap it in a minimal, otherwise-ordinary single-frame GIF.
+    std::string gif = "GIF89a";
+    auto        u16 = [&](int v) {
+        gif.push_back(char(v & 0xff));
+        gif.push_back(char((v >> 8) & 0xff));
+    };
+    u16(w);
+    u16(h);
+    gif.push_back(char(0x80));                         // global color table, 2 entries
+    gif.push_back(0);                                  // background color index
+    gif.push_back(0);                                  // pixel aspect ratio
+    gif += std::string("\x00\x00\x00\xff\xff\xff", 6); // black, white
+
+    gif.push_back(char(0x2C)); // image descriptor
+    u16(0);
+    u16(0);
+    u16(w);
+    u16(h);
+    gif.push_back(0); // no local color table, not interlaced
+
+    gif.push_back(char(lzwCs));
+    for (size_t i = 0; i < bw.bytes.size(); i += 255) { // GIF data sub-blocks, 255 bytes max each
+        const size_t n2 = std::min(size_t(255), bw.bytes.size() - i);
+        gif.push_back(char(n2));
+        gif.append(reinterpret_cast<const char *>(bw.bytes.data() + i), n2);
+    }
+    gif.push_back(0);          // sub-block terminator
+    gif.push_back(char(0x3B)); // trailer
+
+    std::vector<AnimFrame> frames;
+    CHECK(decodeAnimation(gif, &frames) && frames.size() == 1);
+    CHECK(frames.size() == 1 && frames[0].frame.width() == w && frames[0].frame.height() == h);
+}
+
 // M17: a bitmap shrunk once to snappedSize() paints exactly what a Smooth
 // drawBitmap of the original paints (which shrinks on every call).
 void testSnapped() {
@@ -1627,6 +1699,7 @@ const Group kGroups[] = {
     {"decode", testDecode},
     {"anim", testAnim},
     {"animbudget", testAnimBudget},
+    {"giflzwlimit", testGifLzwDictionaryLimit},
     {"snapped", testSnapped},
     {"icons", testIcons},
     {"paint2", testPaint2},

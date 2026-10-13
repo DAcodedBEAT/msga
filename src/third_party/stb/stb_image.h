@@ -4105,14 +4105,18 @@ static stbi_uc *stbi__process_gif_raster(stbi__context *s, stbi__gif *g)
             }
 
             if (oldcode >= 0) {
-               p = &g->codes[avail++];
-               if (avail > 8192) {
-                  return stbi__errpuc("too many codes", "Corrupt GIF");
+               // msga patch: stop growing the dictionary at 4096 entries.
+               // - a 12-bit code can't address past slot 4095 anyway
+               // - upstream keeps growing, overflows codes[8192], and
+               //   aborts the rest of the frame
+               // - hit this on a real GIF that stopped animating partway
+               //   through because one frame ran long without a clear code
+               if (avail < 4096) {
+                  p = &g->codes[avail++];
+                  p->prefix = (stbi__int16) oldcode;
+                  p->first = g->codes[oldcode].first;
+                  p->suffix = (code == avail) ? p->first : g->codes[code].first;
                }
-
-               p->prefix = (stbi__int16) oldcode;
-               p->first = g->codes[oldcode].first;
-               p->suffix = (code == avail) ? p->first : g->codes[code].first;
             } else if (code == avail)
                return stbi__errpuc("illegal code in raster", "Corrupt GIF");
 
