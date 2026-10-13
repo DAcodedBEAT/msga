@@ -1655,6 +1655,10 @@ void MessageRow::buildUnfurl(ui::View *col, const model::Message &m, size_t inde
             ->style()
             .margins(8, 0, 0, 0);
     if (const std::string place = placeLabel(ctx.store, a.channel); !place.empty()) {
+        // A thread reply opens in its thread (Slack's from_url has its thread_ts).
+        const mrkdwn::MessageRef ref    = mrkdwn::parseMessageLink(a.link);
+        const Ts                 thread = ref.conv == a.channel ? model::parseTs(ref.threadTs) : 0;
+
         // Jumps to the quoted message, same as a permalink link (rich.cpp).
         auto *posted = lines->add<RichLabel>(ctx, this);
         posted->setContent(
@@ -1662,10 +1666,10 @@ void MessageRow::buildUnfurl(ui::View *col, const model::Message &m, size_t inde
             {{mrkdwn::Kind::Link, {}}},
             {}
         );
-        posted->onLink = [this, channel = a.channel, ts = a.ts](uint32_t) {
+        posted->onLink = [this, channel = a.channel, ts = a.ts, thread](uint32_t) {
             const model::ConvRef c = _list.ctx().store().findConversation(channel);
             if (c != model::kNoConv && _list.ctx().openMessage)
-                _list.ctx().openMessage(c, ts, 0);
+                _list.ctx().openMessage(c, ts, thread);
         };
         posted->setMaxLines(1);
     }

@@ -3157,6 +3157,54 @@ TEST("blocks: a table, a canvas card and a selection as rendered (MSGA_TEST_DUMP
     win.reset();
 }
 
+TEST("blocks: a forwarded message's \"Posted in\" jumps to it, a reply in its thread") {
+    Env e(false);
+    struct Jump {
+        ConvRef c;
+        Ts      ts, thread;
+    };
+    std::vector<Jump> jumps;
+    e.ctx.openMessage    = [&](ConvRef c, Ts ts, Ts th) { jumps.push_back({c, ts, th}); };
+    const int64_t     t0 = base::nowSecs() - 3600;
+    model::Attachment root;
+    root.msgUnfurl          = true;
+    root.linkPreview        = true;
+    root.author             = "Mira";
+    root.channel            = "C1";
+    root.ts                 = model::parseTs("1700000000.000100");
+    root.text               = "the root";
+    root.link               = "https://acme.slack.com/archives/C1/p1700000000000100";
+    model::Attachment reply = root;
+    reply.ts                = model::parseTs("1700000000.000200");
+    reply.text              = "a reply";
+    reply.link =
+        "https://acme.slack.com/archives/C1/p1700000000000200?thread_ts=1700000000.000100&cid=C1";
+    model::Message m1 = msg(1, t0, "one");
+    m1.extras().attachments.push_back(root);
+    model::Message m2 = msg(1, t0 + 60, "two");
+    m2.extras().attachments.push_back(reply);
+    std::vector<model::Message> ms;
+    ms.push_back(std::move(m1));
+    ms.push_back(std::move(m2));
+    const ConvRef c = addConv(e.store, std::move(ms));
+    e.list->showConversation(c);
+    pump(8);
+    const auto click = [&](Ts ts) {
+        ui::View *row = e.row(ts);
+        REQUIRE(row != nullptr);
+        auto *posted = static_cast<RichLabel *>(findLeaf(row, "Posted in #design"));
+        REQUIRE(posted != nullptr);
+        jumps.clear();
+        posted->onLink(1);
+        REQUIRE(jumps.size() == 1);
+        CHECK(jumps[0].c == c);
+    };
+    click(t0 * 1000000);
+    CHECK(jumps[0].ts == root.ts && jumps[0].thread == 0);
+    click((t0 + 60) * 1000000);
+    CHECK(jumps[0].ts == reply.ts && jumps[0].thread == root.ts);
+}
+
 TEST("blocks: a forwarded canvas's card re-binds once its preview is in") {
     struct CanvasBackend : DownloadingBackend {
         using DownloadingBackend::DownloadingBackend;
