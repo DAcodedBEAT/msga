@@ -1296,19 +1296,7 @@ void MessageRow::buildContent(ui::View *col, const model::Message &m, bool root)
         buildBody(ctx, body, m.text, o, this);
     }
     buildButtons(col, m, 0);
-    // The pictures first (one with its name, 2+ as a gallery), then
-    // the other files.
-    std::vector<const model::File *> previews;
-    for (const model::File &f : m.files())
-        if (isInlinePreview(f))
-            previews.push_back(&f);
-    if (previews.size() >= 2)
-        buildGallery(col, previews, root ? m.ts : 0);
-    else if (previews.size() == 1)
-        buildFile(col, *previews[0], root ? m.ts : 0);
-    for (const model::File &f : m.files())
-        if (!isInlinePreview(f))
-            buildFile(col, f, root ? m.ts : 0);
+    buildFilesSection(col, m.files(), root ? m.ts : 0);
     for (size_t i = 0; i < m.attachments().size(); ++i)
         if (!_list.attachmentHidden(m, i))
             buildAttachment(col, m, i, root);
@@ -1521,6 +1509,20 @@ void MessageRow::buildFile(ui::View *col, const model::File &f, Ts ts) {
     };
 }
 
+void MessageRow::buildFilesSection(ui::View *col, const std::vector<model::File> &files, Ts ts) {
+    std::vector<const model::File *> previews;
+    for (const model::File &f : files)
+        if (isInlinePreview(f))
+            previews.push_back(&f);
+    if (previews.size() >= 2)
+        buildGallery(col, previews, ts);
+    else if (previews.size() == 1)
+        buildFile(col, *previews[0], ts);
+    for (const model::File &f : files)
+        if (!isInlinePreview(f))
+            buildFile(col, f, ts);
+}
+
 bool MessageRow::dismissable(int index) const {
     // Dismissable: link previews (a shared message too), not
     // table messages.
@@ -1652,9 +1654,27 @@ void MessageRow::buildUnfurl(ui::View *col, const model::Message &m, size_t inde
         top->add<ui::Label>(base::formatTime(model::tsSecs(a.ts)), Font::Small, C::TextFaint)
             ->style()
             .margins(8, 0, 0, 0);
-    if (const std::string place = placeLabel(ctx.store, a.channel); !place.empty())
-        lines->add<ui::Label>(arg(tr("Posted in %1"), place), Font::Small, C::TextMuted)
-            ->setMaxLines(1);
+    if (const std::string place = placeLabel(ctx.store, a.channel); !place.empty()) {
+        // A thread reply opens in its thread (Slack's from_url has its thread_ts).
+        const mrkdwn::MessageRef ref    = mrkdwn::parseMessageLink(a.link);
+        const Ts                 thread = ref.conv == a.channel ? model::parseTs(ref.threadTs) : 0;
+
+        // Jumps to the quoted message, same as a permalink link (rich.cpp).
+        // Muted, underlines on hover like Slack's own client --
+        // Kind::Link targets already get that for free (RichLabel::hoverLink).
+        auto *posted = lines->add<RichLabel>(ctx, this);
+        posted->setContent(
+            styled(arg(tr("Posted in %1"), place), Font::Small, C::TextMuted, 1),
+            {{mrkdwn::Kind::Link, {}}},
+            {}
+        );
+        posted->onLink = [this, channel = a.channel, ts = a.ts, thread](uint32_t) {
+            const model::ConvRef c = _list.ctx().store().findConversation(channel);
+            if (c != model::kNoConv && _list.ctx().openMessage)
+                _list.ctx().openMessage(c, ts, thread);
+        };
+        posted->setMaxLines(1);
+    }
     auto *body = card->add<ui::View>();
     body->style().spacing(0).margins(0, 6, 0, 0);
     const int  key      = index == SIZE_MAX ? -1 : int(index);
@@ -1694,8 +1714,7 @@ void MessageRow::buildUnfurl(ui::View *col, const model::Message &m, size_t inde
         more->onLink = [this, ts = m.ts, key](uint32_t) { _list.toggleUnfurl(ts, key); };
         more->style().margins(0, 2, 0, 0);
     }
-    for (const model::File &f : a.files)
-        addFileChip(card, f, nullptr, 0)->style().margins(0, 6, 0, 0);
+    buildFilesSection(card, a.files, 0);
 }
 
 void MessageRow::buildReactions(ui::View *col, const model::Message &m) {

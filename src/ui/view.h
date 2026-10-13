@@ -343,6 +343,9 @@ public:
     virtual void    paint(gfx::Painter &p);
     // After the children (scrollbars, focus rings, overlays within the view).
     virtual void    paintOver(gfx::Painter &p) {}
+    // True while paintOver draws hover-only content -- scrolling can't just
+    // shift the old pixels for that (nothing repaints it while state stays put).
+    virtual bool    hasLiveOverlay() const { return false; }
     // Return true when handled (stops bubbling; for PointerDown also captures).
     virtual bool    onEvent(Event &e) { return false; }
     // Deepest view at `local` (default: children front to back, then this).
