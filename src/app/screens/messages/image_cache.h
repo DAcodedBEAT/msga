@@ -144,7 +144,12 @@ private:
     void   load(Entry &e);
     void   decode(uint64_t id, Request r, bool animated, bool urgent = false);
     void deliver(uint64_t id, std::vector<gfx::AnimFrame> frames, bool ok, bool transient = false);
-    void evict();
+    // `exemptOversized`: an entry bigger than the whole budget is skipped
+    // instead of evicted -- used after a normal insert, where evicting it
+    // would just force an immediate reload. A real setBudget() (including
+    // "Clear cache"'s setBudget(0)) is a deliberate request and must still
+    // evict everything down to the new budget, so it doesn't set this.
+    void evict(bool exemptOversized = false);
     void lruUnlink(Entry &e);
     void lruPushFront(Entry &e);
     void noteSize(const std::string &path, int w, int h, bool ok);

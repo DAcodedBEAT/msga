@@ -259,6 +259,25 @@ TEST("image: decodes off the UI thread, scales, masks circles, evicts by bytes")
     CHECK(cache.naturalSize(asset("avatars/mira.png"), &w, &h) && w == 256 && h == 256);
 }
 
+TEST("image: an entry bigger than the whole budget stays cached and coexists with others") {
+    ImageCache                cache(app().platform(), 1000); // smaller than any real entry below
+    const ImageCache::Request big{asset("avatars/mira.png"), 64, 64}; // 16384 bytes, already over budget alone
+    CHECK(cache.get(big) == nullptr);
+    REQUIRE(until([&] { return cache.pending() == 0; }));
+    REQUIRE(cache.get(big) != nullptr); // oversized, but cached anyway
+
+    const ImageCache::Request small{asset("avatars/jonas.png"), 8, 8};
+    CHECK(cache.get(small) == nullptr);
+    REQUIRE(until([&] { return cache.pending() == 0; }));
+    CHECK(cache.get(big) != nullptr);   // still cached -- not evicted/reloaded as collateral
+    CHECK(cache.get(small) != nullptr); // coexists with it
+
+    // A deliberate shrink still evicts everything, oversized or not
+    // ("Clear cache" relies on this via setBudget(0)).
+    cache.setBudget(0);
+    CHECK(cache.bytes() == 0);
+}
+
 TEST("image: CachedImage shows a placeholder, then the image, without blocking") {
     Env   e(false);
     auto *img = e.win->root().add<CachedImage>(

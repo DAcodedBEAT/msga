@@ -359,16 +359,28 @@ void ImageCache::deliver(uint64_t id, std::vector<gfx::AnimFrame> frames, bool o
     _waited.erase(e);
     for (ui::View *v : waiters)
         v->update();
-    evict();
+    evict(true);
 }
 
-void ImageCache::evict() {
+void ImageCache::evict(bool exemptOversized) {
+    // See the header: skip, don't evict, an entry too big for the whole
+    // budget to avoid an evict/reload loop against it -- only when the
+    // caller is just reacting to a new insert, not a deliberate shrink.
+    size_t oversized = 0;
+    if (exemptOversized)
+        for (Entry *e = _lruTail; e; e = e->prev)
+            if (e->bytes > _budget)
+                oversized += e->bytes;
     // The least recently used ready entry goes first, O(1) each.
-    while (_bytes > _budget && _lruTail) {
-        Entry &victim = *_lruTail;
-        lruUnlink(victim);
-        _bytes -= victim.bytes;
-        _entries.erase(victim.key()); // destroys it; held handles expire
+    Entry *e = _lruTail;
+    while (e && _bytes - oversized > _budget) {
+        Entry *prev = e->prev; // captured before lruUnlink clears it
+        if (!exemptOversized || e->bytes <= _budget) {
+            lruUnlink(*e);
+            _bytes -= e->bytes;
+            _entries.erase(e->key()); // destroys it; held handles expire
+        }
+        e = prev;
     }
     // Failed ones, oldest first (one asked for again since is not failed now).
     if (_failed.size() <= kMaxFailed)
