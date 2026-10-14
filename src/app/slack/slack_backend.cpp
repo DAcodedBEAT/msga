@@ -134,6 +134,7 @@ struct SlackBackend::Read {
         ApiDone     done;
         int         attempt = 0;
         Lane        lane    = Lane::Normal;
+        bool        quiet   = false; // a 429 waits without the banner
     };
     model::OneShotTimers                     timers{b._app}; // pending one-shots
     plat::TimerId                            tickTimer = 0;
@@ -150,18 +151,26 @@ struct SlackBackend::Read {
 
     int64_t now() const { return base::monotonicMs() * speed; }
     void    later(int64_t ms, std::function<void()> fn);
-    void    call(std::string method, std::string form, ApiDone done, Lane lane = Lane::Normal);
-    void    issue(Call c);
-    void    pumpPaced();
+    void    call(
+        std::string method,
+        std::string form,
+        ApiDone     done,
+        Lane        lane  = Lane::Normal,
+        bool        quiet = false
+    );
+    void issue(Call c);
+    void pumpPaced();
     struct Pager {
         std::string                              method, form, key;
         std::function<void(const json::Value &)> onPage;
         std::function<void(const std::string &)> onDone;
         int                                      maxPages = 0, pages = 0; // 0: no cap
-        Lane                                     lane = Lane::Normal;
+        Lane                                     lane  = Lane::Normal;
+        bool                                     quiet = false;
     };
     // maxPages > 0: a backstop against a cursor loop (a server repeating the
-    // same next_cursor forever); reaching it fails with "page_limit".
+    // same next_cursor forever); reaching it fails with "page_limit". quiet:
+    // a load nobody waits on, whose 429s only wait (no banner).
     void paginate(
         std::string                              method,
         std::string                              form,
@@ -169,7 +178,8 @@ struct SlackBackend::Read {
         std::function<void(const json::Value &)> onPage,
         std::function<void(const std::string &)> onDone,
         int                                      maxPages = 0,
-        Lane                                     lane     = Lane::Normal
+        Lane                                     lane     = Lane::Normal,
+        bool                                     quiet    = false
     );
     void        pageFrom(std::shared_ptr<Pager> p, std::string cursor);
     std::string teamForm(std::initializer_list<std::pair<std::string_view, std::string_view>> kv);
@@ -189,6 +199,7 @@ struct SlackBackend::Read {
     void                          connectSettled();
     void                          loadUsers(std::function<void(const std::string &)> done);
     void                          mergeUsers(std::vector<model::User> users);
+    void                          noteOffRoster(const std::unordered_set<std::string> &inSnapshot);
     void                          loadConversations(std::function<void(const std::string &)> done);
     void                          loadViaWebClient(std::function<void(const std::string &)> done);
     void                          applyRoster(std::vector<model::Conversation> convs);
@@ -379,8 +390,10 @@ void SlackBackend::Read::later(int64_t ms, std::function<void()> fn) {
     timers.after(int(std::max<int64_t>(ms / speed, 0)), std::move(fn));
 }
 
-void SlackBackend::Read::call(std::string method, std::string form, ApiDone done, Lane lane) {
-    Call c{std::move(method), std::move(form), std::move(done), 0, lane};
+void SlackBackend::Read::call(
+    std::string method, std::string form, ApiDone done, Lane lane, bool quiet
+) {
+    Call c{std::move(method), std::move(form), std::move(done), 0, lane, quiet};
     if (lane == Lane::Normal) {
         ++normalPending;
         issue(std::move(c));
@@ -437,7 +450,8 @@ void SlackBackend::Read::issue(Call c) {
         return;
     }
     const std::string method = c.method, form = c.form;
-    b.api(
+    const bool        quiet = c.quiet;
+    b.issueApi(
         method,
         form,
         [this, c = std::move(c)](const json::Document &doc, const std::string &err) mutable {
@@ -467,7 +481,9 @@ void SlackBackend::Read::issue(Call c) {
                 c.done(doc, err);
             if (held && *alive)
                 pumpPaced();
-        }
+        },
+        false,
+        quiet
     );
 }
 
@@ -498,13 +514,15 @@ void SlackBackend::Read::paginate(
     std::function<void(const json::Value &)> onPage,
     std::function<void(const std::string &)> onDone,
     int                                      maxPages,
-    Lane                                     lane
+    Lane                                     lane,
+    bool                                     quiet
 ) {
     auto p      = std::make_shared<Pager>(Pager{
         std::move(method), std::move(form), std::move(key), std::move(onPage), std::move(onDone)
     });
     p->maxPages = maxPages;
     p->lane     = lane;
+    p->quiet    = quiet;
     pageFrom(std::move(p), {});
 }
 
@@ -532,7 +550,8 @@ void SlackBackend::Read::pageFrom(std::shared_ptr<Pager> p, std::string cursor) 
             else
                 pageFrom(p, std::string(next));
         },
-        p->lane
+        p->lane,
+        p->quiet
     );
 }
 
@@ -656,44 +675,52 @@ void SlackBackend::Read::connectSettled() {
 }
 
 void SlackBackend::Read::loadUsers(std::function<void(const std::string &)> done) {
-    auto acc     = std::make_shared<std::vector<model::User>>();
+    // Each page lands as it comes (a big org's roster takes many pages, and
+    // one that gives up keeps the pages before it); who is off the roster is
+    // only known once the last page is in.
+    auto seen    = std::make_shared<std::unordered_set<std::string>>();
     usersLoading = true;
     paginate(
         "users.list",
         teamForm({{"limit", "200"}}),
         "members",
-        [acc](const json::Value &arr) {
+        [this, seen](const json::Value &arr) {
+            std::vector<model::User> page;
             for (const json::Value u : arr) {
                 model::User m = mapjson::toUser(u);
-                if (!m.id.empty())
-                    acc->push_back(std::move(m));
+                if (!m.id.empty()) {
+                    seen->insert(m.id);
+                    page.push_back(std::move(m));
+                }
             }
+            mergeUsers(std::move(page));
         },
-        [this, acc, done = std::move(done)](const std::string &err) {
+        [this, seen, done = std::move(done)](const std::string &err) {
             usersLoading = false;
             if (!err.empty()) {
                 LOG_WARN("slack", "users.list: %s", err.c_str());
             } else {
-                mergeUsers(std::move(*acc));
+                noteOffRoster(*seen);
                 usersLoaded = true;
                 fetchMissingDmUsers();
                 fixGroupMembers();
                 later(kOffRosterProbeMs, [this] { reprobeOffRoster(); });
             }
             done(err);
-        }
+        },
+        0,
+        Lane::Normal,
+        true // a throttled page just waits it out: no banner
     );
 }
 
-// A user snapshot merges: snapshot rows win, known enrichment fills their
-// gaps, and users the snapshot omits are kept (Slack Connect peers are never
-// in users.list; departed members come back as deleted rows, not absences).
+// A users.list page merges: its rows win, known enrichment fills their gaps,
+// and users it omits are kept (Slack Connect peers are never in users.list;
+// departed members come back as deleted rows, not absences).
 void SlackBackend::Read::mergeUsers(std::vector<model::User> users) {
     if (users.empty())
-        return; // an empty snapshot says nothing
-    std::unordered_set<std::string> inSnapshot;
+        return;
     for (model::User &u : users) {
-        inSnapshot.insert(u.id);
         if (const UserRef r = s.findUser(u.id); r != kNoUser) {
             const model::User &old = s.user(r);
             if (!old.placeholder) {
@@ -714,6 +741,13 @@ void SlackBackend::Read::mergeUsers(std::vector<model::User> users) {
         }
         s.addUser(std::move(u));
     }
+    s.usersChanged();
+}
+
+// The whole users.list is in: known users it never named are off the roster.
+void SlackBackend::Read::noteOffRoster(const std::unordered_set<std::string> &inSnapshot) {
+    if (inSnapshot.empty())
+        return; // an empty snapshot says nothing
     std::unordered_set<std::string> off;
     for (size_t i = 0; i < s.userCount(); ++i) {
         const model::User &u = s.user(UserRef(i));
@@ -723,7 +757,6 @@ void SlackBackend::Read::mergeUsers(std::vector<model::User> users) {
     offRoster = std::move(off);
     for (auto it = probedAt.begin(); it != probedAt.end();)
         it = offRoster.count(it->first) ? std::next(it) : probedAt.erase(it);
-    s.usersChanged();
 }
 
 void SlackBackend::Read::loadConversations(std::function<void(const std::string &)> done) {

@@ -495,6 +495,36 @@ TEST("slack features: banners — rate limits (throttled) and failed sends in wo
     CHECK(e.store.conversation(e.conv("C1")).messages.empty()); // the ghost is gone
 }
 
+TEST("slack features: a throttled users.list page waits unseen; earlier pages show at once") {
+    if (!haveServer())
+        return;
+    Env        e(R"({"users.list": {"ok": true, "members": [
+                 {"id": "UME", "name": "me", "profile": {"real_name": "Me Myself"}},
+                 {"id": "UMIRA", "name": "mira", "profile": {"real_name": "Mira Okafor"}}],
+               "response_metadata": {"next_cursor": "p2"}},
+              "users.list?cursor=p2": [
+                 {"ok": false, "error": "ratelimited", "__status": 429,
+                  "__headers": {"Retry-After": "30"}},
+                 {"ok": true, "members": [
+                    {"id": "UJONAS", "name": "jonas", "profile": {"display_name": "Jonas"}}],
+                  "response_metadata": {"next_cursor": ""}}]})");
+    const auto named = [&](const char *id) {
+        const model::UserRef r = e.store.findUser(id);
+        return r != model::kNoUser && !e.store.user(r).placeholder;
+    };
+    // Page one is in while page two waits out its Retry-After (connect
+    // settles only once the whole list is).
+    bool settled = false;
+    e.be->connect([&](bool, const std::string &) { settled = true; });
+    REQUIRE(pumpUntil([&] { return named("UMIRA"); }, 3000));
+    CHECK_FALSE(named("UJONAS"));
+    REQUIRE(pumpUntil([&] { return settled && !e.be->connecting(); }, 5000));
+    CHECK(named("UJONAS"));
+    CHECK_STR(e.store.user(e.store.findUser("UJONAS")).displayName, "Jonas");
+    for (const std::string &m : e.errors)
+        CHECK(m.find("rate-limiting") == std::string::npos);
+}
+
 TEST("slack features: mentioned channels and user groups resolve; dead ids persist") {
     if (!haveServer())
         return;

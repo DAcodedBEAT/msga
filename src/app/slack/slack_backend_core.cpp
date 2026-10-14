@@ -59,15 +59,18 @@ void SlackBackend::api(std::string_view method, std::string form, ApiDone done) 
 // a call sent on the dying token would come back invalid_auth and spend the
 // next single-use refresh token. A call that was already out and comes back
 // rejected after a refresh landed is re-sent on the new token, unrefreshed.
-void SlackBackend::issueApi(std::string method, std::string form, ApiDone done, bool refreshed) {
+void SlackBackend::issueApi(
+    std::string method, std::string form, ApiDone done, bool refreshed, bool quiet
+) {
     if (refreshInFlight()) {
         refreshToken([this,
                       m    = std::move(method),
                       f    = std::move(form),
                       done = std::move(done),
-                      refreshed](bool ok) mutable {
+                      refreshed,
+                      quiet](bool ok) mutable {
             if (ok) {
-                issueApi(std::move(m), std::move(f), std::move(done), refreshed);
+                issueApi(std::move(m), std::move(f), std::move(done), refreshed, quiet);
                 return;
             }
             json::Document none;
@@ -91,6 +94,7 @@ void SlackBackend::issueApi(std::string method, std::string form, ApiDone done, 
          m = method,
          f = std::move(form),
          refreshed,
+         quiet,
          sentWith = std::move(sentWith),
          done     = std::move(done)](const json::Document &doc, const std::string &err) mutable {
             _inflight.erase(
@@ -99,29 +103,31 @@ void SlackBackend::issueApi(std::string method, std::string form, ApiDone done, 
             const bool rejected = err == "token_expired" || err == "invalid_auth";
             if (rejected && !refreshed && (sentWith != _auth.token || refreshInFlight())) {
                 // Sent on a token that has since been (or is being) replaced.
-                issueApi(m, f, std::move(done), true);
+                issueApi(m, f, std::move(done), true, quiet);
                 return;
             }
             if (rejected && !refreshed && canRefresh()) {
                 LOG_INFO("slack", "%s: %s — refreshing the token", m.c_str(), err.c_str());
-                refreshToken([this, m, f = std::move(f), err, done = std::move(done)](bool ok) {
-                    if (ok) {
-                        issueApi(m, f, done, true);
-                        return;
+                refreshToken(
+                    [this, m, f = std::move(f), err, quiet, done = std::move(done)](bool ok) {
+                        if (ok) {
+                            issueApi(m, f, done, true, quiet);
+                            return;
+                        }
+                        // Dead credentials are reported by the refresh; a
+                        // transient failure leaves the workspace signed in (the
+                        // 60 s check tries again) and only this call fails —
+                        // with a reason no caller takes for a dead sign-in.
+                        json::Document none;
+                        if (done)
+                            done(none, _authLost ? err : std::string("token_refresh_failed"));
                     }
-                    // Dead credentials are reported by the refresh; a
-                    // transient failure leaves the workspace signed in (the
-                    // 60 s check tries again) and only this call fails —
-                    // with a reason no caller takes for a dead sign-in.
-                    json::Document none;
-                    if (done)
-                        done(none, _authLost ? err : std::string("token_refresh_failed"));
-                });
+                );
                 return;
             }
             if (!err.empty() && authError(err))
                 loseAuth(err);
-            if (err == "ratelimited")
+            if (err == "ratelimited" && !quiet)
                 noteRateLimited(m, std::max<int64_t>(doc.root()["retry_after"].integer(1), 1));
             if (done)
                 done(doc, err);

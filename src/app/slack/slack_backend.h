@@ -320,7 +320,10 @@ private:
     void refreshToken(std::function<void(bool ok)> then);
     bool canRefresh() const;
     bool refreshInFlight() const;
-    void issueApi(std::string method, std::string form, ApiDone done, bool refreshed);
+    // quiet: a 429 is not put on the banner (the caller waits it out unseen).
+    void issueApi(
+        std::string method, std::string form, ApiDone done, bool refreshed, bool quiet = false
+    );
     void loseAuth(const std::string &error);
     // A 429 on any call: the error banner, throttled.
     void noteRateLimited(const std::string &method, int64_t secs);
