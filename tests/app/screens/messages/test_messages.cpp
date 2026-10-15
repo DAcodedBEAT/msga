@@ -278,6 +278,116 @@ TEST("image: an entry bigger than the whole budget stays cached and coexists wit
     CHECK(cache.bytes() == 0);
 }
 
+TEST("image: the oversized list has its own byte budget, not an entry-count cap") {
+    // budget 10000: 16900-byte entries (65x65) are oversized (> budget),
+    // and the oversized budget (4x, see kOversizedBudgetMultiple) is
+    // 40000 -- two fit (33800), a third doesn't (50700).
+    ImageCache                cache(app().platform(), 10000);
+    const ImageCache::Request oldest{asset("avatars/mira.png"), 65, 65};
+    const ImageCache::Request middle{asset("avatars/jonas.png"), 65, 65};
+    const ImageCache::Request newest{asset("avatars/lena.png"), 65, 65};
+
+    cache.get(oldest);
+    REQUIRE(until([&] { return cache.pending() == 0; }));
+    cache.get(middle);
+    REQUIRE(until([&] { return cache.pending() == 0; }));
+    REQUIRE(cache.get(oldest) != nullptr); // precondition for the eviction check below
+    REQUIRE(cache.get(middle) != nullptr);
+
+    // A third pushes the oversized list over its own budget: the least
+    // recently used one (oldest) falls back to ordinary eviction instead
+    // of staying exempt forever -- otherwise many huge files in one
+    // session grow the cache without bound.
+    cache.get(newest);
+    REQUIRE(until([&] { return cache.pending() == 0; }));
+    CHECK(cache.get(oldest) == nullptr);   // evicted, over the oversized budget
+    REQUIRE(cache.get(middle) != nullptr); // precondition for the clear check below
+    REQUIRE(cache.get(newest) != nullptr); // just delivered, never self-evicted
+
+    // A deliberate shrink evicts the oversized list too, not just the
+    // main one ("Clear cache" relies on this via setBudget(0)).
+    cache.setBudget(0);
+    CHECK(cache.bytes() == 0);
+    CHECK(cache.get(middle) == nullptr);
+    CHECK(cache.get(newest) == nullptr);
+}
+
+TEST("image: a nonzero budget shrink still evicts the just-delivered oversized entry") {
+    // On passive pressure (a normal insert), the most-recently-delivered
+    // oversized entry is deliberately never evicted by its own insertion
+    // (see evict()). A deliberate setBudget() must NOT carry that
+    // exemption over, even when the new budget isn't 0 -- otherwise the
+    // exemption meant for passive pressure would leak into "Clear cache"
+    // in disguise. budget 10000: a 16900-byte (65x65) entry is oversized,
+    // alone on the oversized list (so it's always its own "head"
+    // entry). Shrinking to 100 (not 0) must still evict it.
+    ImageCache                cache(app().platform(), 10000);
+    const ImageCache::Request big{asset("avatars/mira.png"), 65, 65};
+
+    cache.get(big);
+    REQUIRE(until([&] { return cache.pending() == 0; }));
+    REQUIRE(cache.get(big) != nullptr); // precondition for the shrink check below
+
+    cache.setBudget(100);
+    CHECK(cache.get(big) == nullptr); // deliberate shrink: no exemption, even nonzero
+}
+
+TEST("image: a deliberate shrink uses the plain budget, not the looser oversized one") {
+    // evict()'s oversized ceiling is _budget * kOversizedBudgetMultiple on
+    // passive pressure, but must fall back to the plain _budget on a
+    // deliberate setBudget() -- otherwise "evicts everything down to the
+    // new budget" is a lie whenever the shrink still leaves room under the
+    // looser (4x) ceiling. budget 10000, oversized ceiling (passive) 40000:
+    // a 16900-byte entry fits under 40000 but not under a shrunk budget of
+    // 5000 (ceiling 20000 if the bug were still there, but should use the
+    // plain 5000 instead).
+    ImageCache                cache(app().platform(), 10000);
+    const ImageCache::Request big{asset("avatars/mira.png"), 65, 65};
+
+    cache.get(big);
+    REQUIRE(until([&] { return cache.pending() == 0; }));
+    REQUIRE(cache.get(big) != nullptr);
+
+    cache.setBudget(5000);
+    CHECK(cache.get(big) == nullptr); // 16900 > 5000, even though 16900 <= 5000*4
+}
+
+TEST("image: setBudget() with an unchanged value is a no-op, not a re-evict") {
+    // setBudget() used to always call evict() with no exemption, even when
+    // the budget didn't actually change -- so toggling an unrelated
+    // setting (which still calls applySettings() -> setBudget()) could
+    // evict an in-view oversized entry for no reason, the same failure
+    // mode as the original bug.
+    ImageCache                cache(app().platform(), 10000);
+    const ImageCache::Request big{asset("avatars/mira.png"), 65, 65};
+
+    cache.get(big);
+    REQUIRE(until([&] { return cache.pending() == 0; }));
+    REQUIRE(cache.get(big) != nullptr); // exempt as the just-delivered entry
+
+    cache.setBudget(10000); // same value as the constructor's budget
+    CHECK(cache.get(big) != nullptr); // must still be there: no-op, not a re-evict
+}
+
+TEST("image: several modestly-oversized entries can coexist, not just one") {
+    // budget 10000: 12100-byte entries (55x55) are oversized, but three
+    // of them (36300) still fit the 40000 oversized budget -- a fixed
+    // "keep the top N" count cap would have evicted the oldest here even
+    // though there was room; this is the margin case found in review.
+    ImageCache                cache(app().platform(), 10000);
+    const ImageCache::Request a{asset("avatars/mira.png"), 55, 55};
+    const ImageCache::Request b{asset("avatars/jonas.png"), 55, 55};
+    const ImageCache::Request c{asset("avatars/lena.png"), 55, 55};
+
+    for (const ImageCache::Request &r : {a, b, c}) {
+        cache.get(r);
+        REQUIRE(until([&] { return cache.pending() == 0; }));
+    }
+    CHECK(cache.get(a) != nullptr);
+    CHECK(cache.get(b) != nullptr);
+    CHECK(cache.get(c) != nullptr);
+}
+
 TEST("image: CachedImage shows a placeholder, then the image, without blocking") {
     Env   e(false);
     auto *img = e.win->root().add<CachedImage>(

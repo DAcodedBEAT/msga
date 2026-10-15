@@ -17,6 +17,8 @@
 // least-recently-used once the total passes the budget (default 48 MB);
 // handed-out bitmaps are shared_ptrs, so eviction never pulls pixels from
 // under a paint. A file that fails to decode is remembered (no retry storm).
+// An entry bigger than the whole budget gets a separate list/budget
+// instead of being evicted the instant anything else needs room.
 //
 // A path is an absolute local file (fixture assets, uploads) or an http(s)
 // URL: URLs are downloaded to disk by RemoteImages (setRemote; without one
@@ -114,7 +116,8 @@ public:
     void setAnimateEmoji(bool on) { _animateEmoji = on; }
     bool animateEmoji() const { return _animateEmoji; }
 
-    size_t bytes() const { return _bytes; }
+    // Main + oversized list; can exceed budget() by design.
+    size_t bytes() const { return _bytes + _oversizedBytes; }
     size_t budget() const { return _budget; }
     void   setBudget(size_t b);
     size_t entryCount() const;
@@ -144,14 +147,13 @@ private:
     void   load(Entry &e);
     void   decode(uint64_t id, Request r, bool animated, bool urgent = false);
     void deliver(uint64_t id, std::vector<gfx::AnimFrame> frames, bool ok, bool transient = false);
-    // `exemptOversized`: an entry bigger than the whole budget is skipped
-    // instead of evicted -- used after a normal insert, where evicting it
-    // would just force an immediate reload. A real setBudget() (including
-    // "Clear cache"'s setBudget(0)) is a deliberate request and must still
-    // evict everything down to the new budget, so it doesn't set this.
-    void evict(bool exemptOversized = false);
+    // `protect`: the oversized entry to never evict (see _lastOversized).
+    // Null for a real setBudget(): deliberate shrinks have no exemption.
+    void evict(Entry *protect = nullptr);
     void lruUnlink(Entry &e);
     void lruPushFront(Entry &e);
+    void oLruUnlink(Entry &e);
+    void oLruPushFront(Entry &e);
     void noteSize(const std::string &path, int w, int h, bool ok);
 
     plat::App                                               &_app;
@@ -163,6 +165,17 @@ private:
     std::vector<std::weak_ptr<Entry>> _failed; // failed entries, oldest first
     std::unordered_map<uint64_t, std::function<void(gfx::Bitmap)>> _once; // decodeOnce
     Entry *_lruHead = nullptr, *_lruTail = nullptr; // ready entries, most recent first
+    // Entries bigger than the whole budget get their own list/budget
+    // (kOversizedBudgetMultiple × _budget), so:
+    // - a huge file doesn't thrash against unrelated small entries
+    // - several huge files can't grow the cache unbounded either
+    // Worst case: _budget * (1 + kOversizedBudgetMultiple).
+    Entry *_oHead = nullptr, *_oTail = nullptr; // oversized entries, most recent first
+    size_t _oversizedBytes = 0;
+    // Most recently *delivered* oversized entry, not most recently
+    // *touched* (_oHead) -- otherwise just viewing an old entry would
+    // make it permanently immune instead of the newest one.
+    Entry *_lastOversized = nullptr;
     struct SizeMemo {
         int     w = 0, h = 0;
         bool    ok      = false;
