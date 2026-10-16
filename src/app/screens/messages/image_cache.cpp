@@ -21,11 +21,9 @@ constexpr int64_t kMissingMemoMs = 5000;
 // Failed entries kept (each answers failed() and stops a retry storm); the
 // oldest beyond go, so a long session's dead links don't pile up.
 constexpr size_t  kMaxFailed     = 256;
-// The oversized list's own budget, as a multiple of _budget (see the
-// header on _oversizedBytes). 4x comfortably fits a couple of
-// realistically-oversized files (the bug this exists for: a 69MB GIF
-// against a 48MB budget, ~1.4x) without being unbounded.
-constexpr size_t  kOversizedBudgetMultiple = 4;
+// A picture delivered to waiting views counts as in use this long, until
+// they paint and take it (a frame, give or take a busy loop).
+constexpr int64_t kFreshMs       = 1000;
 
 } // namespace
 
@@ -59,16 +57,22 @@ struct ImageCache::Entry {
     std::vector<ui::View *> waiters;
     size_t                  bytes = 0;
     uint64_t                id    = 0;
-    Entry  *prev = nullptr, *next = nullptr;   // the main LRU list (Ready, <= budget)
-    Entry  *oPrev = nullptr, *oNext = nullptr; // the oversized LRU list (Ready, > budget)
+    int64_t                 fresh = 0; // ms delivered to waiters, until one asks again
+    Entry                  *prev = nullptr, *next = nullptr; // the LRU list (Ready only)
     bool                    retry = false; // a failed download: ask again once RemoteImages would
     enum : uint8_t { Loading, Ready, Failed } state = Loading;
     bool animated                                   = false;
     bool inLru                                      = false;
-    bool inOversizedLru                             = false;
 
     Key     key() const { return keyOf(Ref{path, width, height, shape, radius}, animated); }
     Request request() const { return {path, width, height, shape, radius}; }
+    // Whether something besides the cache keeps the pixels: a view painting
+    // them (CachedImage holds them between lookups), or one they were just
+    // delivered to and that hasn't taken them yet.
+    bool    inUse(int64_t now) const {
+        return (animated ? frames.use_count() : still.use_count()) > 1 ||
+               (fresh && now - fresh < kFreshMs);
+    }
 };
 
 // ── Worker ──────────────────────────────────────────────────────────────────
@@ -192,44 +196,16 @@ void ImageCache::lruPushFront(Entry &e) {
     e.inLru = true;
 }
 
-// Same shape as lruUnlink/lruPushFront, on the oversized list.
-void ImageCache::oLruUnlink(Entry &e) {
-    if (!e.inOversizedLru)
-        return;
-    if (e.oPrev)
-        e.oPrev->oNext = e.oNext;
-    else
-        _oHead = e.oNext;
-    if (e.oNext)
-        e.oNext->oPrev = e.oPrev;
-    else
-        _oTail = e.oPrev;
-    e.oPrev = e.oNext = nullptr;
-    e.inOversizedLru  = false;
-}
-
-void ImageCache::oLruPushFront(Entry &e) {
-    e.oPrev = nullptr;
-    e.oNext = _oHead;
-    if (_oHead)
-        _oHead->oPrev = &e;
-    _oHead = &e;
-    if (!_oTail)
-        _oTail = &e;
-    e.inOversizedLru = true;
-}
-
 ImageCache::Entry *ImageCache::lookup(const Ref &r, bool animated, ui::View *waiter) {
     if (r.path.empty())
         return nullptr;
     if (const auto it = _entries.find(keyOf(r, animated)); it != _entries.end()) {
         Entry &e = *it->second;
+        // Asked again: a view holds it from here, or doesn't.
+        e.fresh  = 0;
         if (e.inLru && _lruHead != &e) { // now the most recently used
             lruUnlink(e);
             lruPushFront(e);
-        } else if (e.inOversizedLru && _oHead != &e) {
-            oLruUnlink(e);
-            oLruPushFront(e);
         }
         // Its cool-down is RemoteImages' (which a sign-in also ends).
         if (e.state == Entry::Failed && e.retry && _remote && !_remote->failedRecently(e.path)) {
@@ -335,14 +311,11 @@ ImageCache::Frames ImageCache::frames(const Ref &r, ui::View *waiter, Handle *he
 
 bool ImageCache::touch(const Handle &h) {
     const std::shared_ptr<Entry> e = h._e.lock();
-    if (!e || !(e->inLru || e->inOversizedLru))
+    if (!e || !e->inLru)
         return false;
-    if (e->inLru && _lruHead != e.get()) {
+    if (_lruHead != e.get()) {
         lruUnlink(*e);
         lruPushFront(*e);
-    } else if (e->inOversizedLru && _oHead != e.get()) {
-        oLruUnlink(*e);
-        oLruPushFront(*e);
     }
     return true;
 }
@@ -387,19 +360,10 @@ void ImageCache::deliver(uint64_t id, std::vector<gfx::AnimFrame> frames, bool o
         } else {
             e->still = std::make_shared<const gfx::Bitmap>(std::move(frames.front().frame));
         }
-        // Oversized entries get their own list/budget (_oversizedBytes).
-        // Classification is sticky -- an entry never reclassifies if
-        // _budget changes later. Harmless today (_budget is effectively
-        // pinned to 48MB by shell.cpp's kImageBudget clamp), but a trap
-        // if that clamp ever moves.
-        if (e->bytes > _budget) {
-            _oversizedBytes += e->bytes;
-            oLruPushFront(*e);
-            _lastOversized = e; // protected below, regardless of what else evict() runs for
-        } else {
-            _bytes += e->bytes;
-            lruPushFront(*e);
-        }
+        _bytes += e->bytes;
+        lruPushFront(*e);
+        if (!e->waiters.empty())
+            e->fresh = base::monotonicMs();
     } else {
         e->state = Entry::Failed;
         e->retry = transient; // the download failed, not the decode: ask again later
@@ -410,37 +374,29 @@ void ImageCache::deliver(uint64_t id, std::vector<gfx::AnimFrame> frames, bool o
     _waited.erase(e);
     for (ui::View *v : waiters)
         v->update();
-    // Protects the most recent oversized delivery even when this one
-    // isn't it -- a small entry's own pressure shouldn't evict it.
-    evict(_lastOversized);
+    evict();
 }
 
-void ImageCache::evict(Entry *protect) {
-    // The main list: least recently used ready entry goes first, O(1) each.
-    Entry *e = _lruTail;
-    while (e && _bytes > _budget) {
-        Entry *prev = e->prev; // captured before lruUnlink clears it
-        lruUnlink(*e);
-        _bytes -= e->bytes;
-        _entries.erase(e->key()); // destroys it; held handles expire
-        e = prev;
-    }
-    // Own (looser) budget so a huge file never competes with small ones.
-    // `protect` is exempt -- evicting it would force an instant reload,
-    // the original bug. setBudget() passes no `protect`: a deliberate
-    // shrink has no exemption, down to the plain budget.
-    const size_t oCap = protect ? _budget * kOversizedBudgetMultiple : _budget;
-    Entry       *o    = _oTail;
-    while (o && _oversizedBytes > oCap) {
-        Entry *prev = o->oPrev; // captured before a possible unlink clears it
-        if (o != protect) {
-            if (o == _lastOversized)
-                _lastOversized = nullptr; // about to be freed -- never a dangling protect target
-            oLruUnlink(*o);
-            _oversizedBytes -= o->bytes;
-            _entries.erase(o->key());
+void ImageCache::evict() {
+    // Pictures in use stay whatever goes, so they don't count against the
+    // budget (one bigger than all of it neither goes nor pushes the rest
+    // out); of the others, the least recently used goes first. A walk over
+    // the ready entries, only while over budget.
+    if (_bytes > _budget) {
+        const int64_t now  = base::monotonicMs();
+        size_t        held = 0;
+        for (const Entry *e = _lruHead; e; e = e->next)
+            if (e->inUse(now))
+                held += e->bytes;
+        for (Entry *e = _lruTail; e && _bytes - held > _budget;) {
+            Entry *const prev = e->prev;
+            if (!e->inUse(now)) {
+                lruUnlink(*e);
+                _bytes -= e->bytes;
+                _entries.erase(e->key()); // destroys it; held handles expire
+            }
+            e = prev;
         }
-        o = prev;
     }
     // Failed ones, oldest first (one asked for again since is not failed now).
     if (_failed.size() <= kMaxFailed)
@@ -453,10 +409,17 @@ void ImageCache::evict(Entry *protect) {
 }
 
 void ImageCache::setBudget(size_t b) {
-    if (b == _budget)
-        return; // an unrelated settings change shouldn't re-evict anything
     _budget = b;
     evict();
+}
+
+size_t ImageCache::cachedBytes() const {
+    const int64_t now = base::monotonicMs();
+    size_t        n   = 0;
+    for (const Entry *e = _lruHead; e; e = e->next)
+        if (!e->inUse(now))
+            n += e->bytes;
+    return n;
 }
 
 size_t ImageCache::entryCount() const {
